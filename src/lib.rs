@@ -21,12 +21,12 @@ use core::{
     mem::{self, ManuallyDrop},
     ops::Index,
     ptr::{self, addr_of, addr_of_mut, NonNull},
-    sync::atomic::{AtomicPtr, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering},
 };
 
 extern crate alloc;
 use alloc::alloc::{alloc, dealloc, handle_alloc_error};
-/// A growing element size linked list with stable pointers.
+/// A lock-free growing element size linked list with stable pointers.
 /// ```
 /// use rose_bloom::Rose;
 /// let rose = Rose::new();
@@ -44,9 +44,10 @@ pub struct Rose<T> {
 
 #[repr(C)]
 struct RoseInner<T> {
-    capacity: usize,
-    length: AtomicUsize,
     next: *mut RoseInner<T>,
+    length: AtomicUsize,
+    capacity: usize,
+    writers: AtomicUsize,
     data: [T; 0],
 }
 
@@ -87,8 +88,10 @@ impl<T> Rose<T> {
         // These should both compile out if they're false because they're all constants.
         assert_ne!(Self::align(), 0);
         assert!(Self::size(1) != 0);
+        let layout = Self::layout(capacity);
+        // SAFETY: Size is not zero, as tested above, so we can alloc.
+        // We check for null pointer and handle the alloc error, so it must be non null.
         unsafe {
-            let layout = Self::layout(capacity);
             let memory = alloc(layout);
             if memory.is_null() {
                 handle_alloc_error(layout)
@@ -106,10 +109,12 @@ impl<T> Rose<T> {
         // Allocation code
         let memory = Self::alloc(1).as_ptr();
         // Initialization code
+        // SAFETY: We are the only ones who can access this memory, so we can initialize it.
         unsafe {
-            addr_of_mut!((*memory).capacity).write(1);
-            addr_of_mut!((*memory).length).write(AtomicUsize::new(0));
             addr_of_mut!((*memory).next).write(ptr::null_mut());
+            addr_of_mut!((*memory).length).write(AtomicUsize::new(0));
+            addr_of_mut!((*memory).capacity).write(1);
+            addr_of_mut!((*memory).writers).write(AtomicUsize::new(0));
         };
         Rose {
             last: AtomicPtr::new(memory),
@@ -122,12 +127,12 @@ impl<T> Rose<T> {
     /// let rose = Rose::new();
     /// rose.push(1);
     /// ```
+    /// 
+    /// This is a O(1) operation.
     pub fn push(&self, value: T) -> &T {
         let item = ManuallyDrop::new(value);
         loop {
-            // I just need to get access to some last element, it doesn't matter if it's out of date.
-            // If it is, we will just try again.
-            let last = self.last.load(Ordering::Relaxed);
+            let last = self.last.load(Ordering::Acquire);
 
             // Both of these are from the same `RoseInner`
             // SAFETY: Last is always a valid pointer.
@@ -144,22 +149,32 @@ impl<T> Rose<T> {
             });
 
             if let Ok(len) = index {
-                // We now "own" the index, as the index was increased.
+                // SAFETY: last is a valid pointer.
+                // We use AcqRel to ensure that other threads are aware we're writing.
+                let writer_count = unsafe { (*last).writers.fetch_add(1, Ordering::AcqRel) };
+                // make sure `writers` isn't about to overflow
+                assert!(
+                    writer_count != usize::MAX,
+                    "writing counter overflow, somehow we have usize::MAX writers"
+                );
+                // SAFETY: We now "own" the index, as the index was increased, so we can write to it.
                 unsafe {
                     let out = ptr::addr_of_mut!((*last).data).cast::<T>().add(len);
                     out.write(addr_of!(item).cast::<T>().read());
+                    // SAFETY: last is a valid pointer.
+                    (*last).writers.fetch_sub(1, Ordering::AcqRel);
                     return &*out;
                 }
             }
 
             let new = Self::alloc(capacity * 2);
-
+            // SAFETY: We just created the pointer, so we can do whatever we want with it.
             let refer = unsafe {
                 let new = new.as_ptr();
-                ptr::addr_of_mut!((*new).capacity).write(capacity * 2);
-                ptr::addr_of_mut!((*new).length).write(AtomicUsize::new(1));
-                ptr::addr_of_mut!((*new).next).write(last);
-                // We just created the pointer, so we can do whatever we want with it.
+                addr_of_mut!((*new).next).write(last);
+                addr_of_mut!((*new).length).write(AtomicUsize::new(1));
+                addr_of_mut!((*new).capacity).write(capacity * 2);
+                addr_of_mut!((*new).writers).write(AtomicUsize::new(0));
                 let out = ptr::addr_of_mut!((*new).data).cast::<T>();
                 out.write(addr_of!(item).cast::<T>().read());
                 &*out
@@ -177,12 +192,31 @@ impl<T> Rose<T> {
             if success.is_ok() {
                 return refer;
             }
-            // We failed to update the pointer, so we need to try again.
+            // Another thread updated the pointer before us.
+            // SAFETY: We just created the pointer via alloc, so we can deallocate it.
             unsafe {
                 dealloc(new.as_ptr().cast::<u8>(), Self::layout(capacity * 2));
             };
         }
     }
+
+    /// Returns the length of this [`Rose<T>`].
+    /// 
+    /// This is an O(1) operation.
+    pub fn len(&self) -> usize {
+        let last = self.last.load(Ordering::Acquire);
+        // SAFETY: last is a valid pointer.
+        let length = unsafe { (*last).length.load(Ordering::Acquire) };
+        let capacity = unsafe { (*last).capacity };
+        let total_capacity = (capacity + 1).next_power_of_two() - 1;
+        total_capacity - capacity + length
+    }
+    /// Are there elements in the [`Rose<T>`]?
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    
+
 }
 
 /// This index is the number from the back.
@@ -190,9 +224,14 @@ impl<T> Index<usize> for Rose<T> {
     type Output = T;
 
     fn index(&self, mut index: usize) -> &Self::Output {
-        let mut current = self.last.load(Ordering::Relaxed);
+        let mut current = self.last.load(Ordering::Acquire);
         while !current.is_null() {
-            let length = unsafe { (*current).length.load(Ordering::Relaxed) };
+            // SAFETY: the pointer is always valid
+            // length - writers is the number of valid writers.
+            let length = unsafe {
+                (*current).length.load(Ordering::Acquire)
+                    - (*current).writers.load(Ordering::Acquire)
+            };
             if length > index {
                 // Great, we found it
                 // SAFETY: add is in bounds because length > index
@@ -211,10 +250,10 @@ impl<T> Index<usize> for Rose<T> {
 }
 impl<T> Drop for Rose<T> {
     fn drop(&mut self) {
-        let mut current = self.last.load(Ordering::Relaxed);
+        let mut current = self.last.load(Ordering::Acquire);
         while !current.is_null() {
             // SAFETY: current is valid, data will have valid data for `length` items
-            let length = unsafe { (*current).length.load(Ordering::Relaxed) };
+            let length = unsafe { (*current).length.load(Ordering::Acquire) };
             let slice = unsafe {
                 core::slice::from_raw_parts_mut(
                     ptr::addr_of_mut!((*current).data).cast::<T>(),
@@ -242,11 +281,34 @@ mod tests {
     fn it_works() {
         use alloc::boxed::Box;
         let rose = Rose::new();
+
+        assert!(rose.is_empty());
         rose.push(Box::new(1));
+        assert_eq!(rose.len(), 1);
         rose.push(Box::new(2));
+        assert_eq!(rose.len(), 2);
         rose.push(Box::new(3));
         assert_eq!(*rose[0], 3);
         assert_eq!(*rose[1], 2);
         assert_eq!(*rose[2], 1);
+        assert_eq!(rose.len(), 3);
+    }
+
+    #[test]
+    fn dataraces() {
+        extern crate std;
+        use std::thread;
+        let rose = Rose::new();
+        rose.push(0);
+        thread::scope(|s| {
+            s.spawn(|| {
+                let _ = rose[0];
+                rose.push(1);
+            });
+            s.spawn(|| {
+                let _ = rose[0];
+                rose.push(2);
+            });
+        });
     }
 }

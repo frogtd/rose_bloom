@@ -1,7 +1,8 @@
 # rose_bloom
 
 `rose_bloom` is a crate for passing out references that won't move when you push to it. It also 
-happens to be accidentally thread-safe, so you can also use it as a concurrent queue.
+happens to be accidentally thread-safe, so you can also use it as a concurrent queue, if you don't
+care about freeing memory. This is a lock-free data structure.
 
 ## Example
 
