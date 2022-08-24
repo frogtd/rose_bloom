@@ -1,6 +1,6 @@
 use core::{
     marker::PhantomData,
-    ptr::{addr_of_mut, NonNull, addr_of},
+    ptr::{addr_of, addr_of_mut, NonNull},
     sync::atomic::{AtomicPtr, Ordering},
 };
 
@@ -37,6 +37,18 @@ impl<'a, T> Iterator for Iter<'a, T> {
         let index = length - self.pos - 1;
         self.pos += 1;
         Some(unsafe { &*base_ptr.add(index) })
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        if self.ptr.is_null() {
+            return (0, Some(0));
+        }
+        let ptr = self.ptr;
+        // SAFETY: ptr is a valid pointer if not null.
+        let length = unsafe { (*ptr).length.load(Ordering::Acquire) };
+        let capacity = unsafe { (*ptr).capacity };
+        let total_capacity = (capacity + 1).next_power_of_two() - 1;
+        let len = total_capacity - capacity + length;
+        (len, Some(len))
     }
 }
 
@@ -82,6 +94,19 @@ impl<'a, T> Iterator for IterMut<'a, T> {
         let index = length - self.pos - 1;
         self.pos += 1;
         Some(unsafe { &mut *base_ptr.add(index) })
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        if self.ptr.is_null() {
+            return (0, Some(0));
+        }
+        let ptr = self.ptr;
+        // SAFETY: ptr is a valid pointer if not null.
+        let length = unsafe { (*ptr).length.load(Ordering::Acquire) };
+        let capacity = unsafe { (*ptr).capacity };
+        let total_capacity = (capacity + 1).next_power_of_two() - 1;
+        let len = total_capacity - capacity + length;
+        (len, Some(len))
     }
 }
 
@@ -142,5 +167,9 @@ impl<T> Iterator for IntoIter<T> {
         let base_ptr = unsafe { addr_of_mut!((*current.as_ptr()).data).cast::<T>() };
 
         Some(unsafe { base_ptr.add(index).read() })
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let len = self.rose.len();
+        (len, Some(len))
     }
 }

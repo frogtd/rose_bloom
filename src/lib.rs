@@ -18,6 +18,9 @@
 #![no_std]
 use core::{
     alloc::Layout,
+    cmp,
+    fmt::{self, Debug, Formatter},
+    hash::{Hash, Hasher},
     mem::{self, ManuallyDrop},
     ops::Index,
     ptr::{self, addr_of, addr_of_mut, NonNull},
@@ -27,7 +30,10 @@ use core::{
 pub mod iter;
 
 extern crate alloc;
-use alloc::{alloc::{alloc, dealloc, handle_alloc_error}, vec::Vec};
+use alloc::{
+    alloc::{alloc, dealloc, handle_alloc_error},
+    vec::Vec,
+};
 /// A lock-free growing element size linked list with stable pointers.
 /// ```
 /// use rose_bloom::Rose;
@@ -296,11 +302,95 @@ impl<T> From<Rose<T>> for Vec<T> {
     }
 }
 
-impl<T> Clone for Rose<T> where T: Clone {
+impl<T> Clone for Rose<T>
+where
+    T: Clone,
+{
     fn clone(&self) -> Self {
-        Self::from(self.into_iter().cloned().collect::<Vec<_>>())
+        let new = Self::new();
+        for x in self.into_iter() {
+            new.push(x.clone());
+        }
+        new
     }
 }
+
+impl<T> Debug for Rose<T>
+where
+    T: Debug,
+{
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_list().entries(self.iter()).finish()
+    }
+}
+
+impl<T> Default for Rose<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T> Eq for Rose<T> where T: Eq {}
+impl<T> PartialEq for Rose<T>
+where
+    T: PartialEq,
+{
+    fn eq(&self, other: &Self) -> bool {
+        self.iter().eq(other.iter())
+    }
+}
+
+impl<T> Hash for Rose<T>
+where
+    T: Hash,
+{
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        let mut current = self.last.load(Ordering::Acquire);
+        while !current.is_null() {
+            let length = unsafe { (*current).length.load(Ordering::Acquire) };
+            let slice = unsafe {
+                core::slice::from_raw_parts(addr_of_mut!((*current).data).cast::<T>(), length)
+            };
+            T::hash_slice(slice, state);
+            let next = unsafe { (*current).next };
+            current = next;
+        }
+    }
+}
+
+impl<T> Extend<T> for Rose<T> {
+    fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
+        for item in iter {
+            self.push(item);
+        }
+    }
+}
+
+impl<T> FromIterator<T> for Rose<T> {
+    fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
+        let mut rose = Self::new();
+        rose.extend(iter);
+        rose
+    }
+}
+impl<T> Ord for Rose<T>
+where
+    T: Ord,
+{
+    fn cmp(&self, other: &Self) -> cmp::Ordering {
+        self.iter().cmp(other.iter())
+    }
+}
+
+impl<T> PartialOrd for Rose<T>
+where
+    T: PartialOrd,
+{
+    fn partial_cmp(&self, other: &Self) -> Option<cmp::Ordering> {
+        self.iter().partial_cmp(other.iter())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
