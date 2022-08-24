@@ -1,6 +1,21 @@
+//! This library provides the `Rose` type, which is a data structure that has stable pointers.
+//! It also happens to concurrent, which was a secondary goal of this project, because you can't
+//! have a safe API without Atomics.
+//!
+//! # Example
+//! ```
+//! use rose_bloom::Rose;
+//!
+//! let rose = Rose::new();
+//! let out1 = rose.push(1);
+//! rose.push(2);
+//! rose.push(3);
+//! println!("{out1}");
+//! ```
+//!
+#![deny(missing_docs)]
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![no_std]
-extern crate alloc;
 use core::{
     alloc::Layout,
     mem::{self, ManuallyDrop},
@@ -9,7 +24,20 @@ use core::{
     sync::atomic::{AtomicPtr, AtomicUsize, Ordering},
 };
 
+extern crate alloc;
 use alloc::alloc::{alloc, dealloc, handle_alloc_error};
+/// A growing element size linked list with stable pointers.
+/// ```
+/// use rose_bloom::Rose;
+/// let rose = Rose::new();
+/// let v = rose.push(1);
+/// let _ = rose.push(2);
+/// let _ = rose.push(3);
+/// assert_eq!(rose[0], 3);
+/// assert_eq!(rose[1], 2);
+/// println!("{}", v); // prints 1
+/// assert_eq!(rose[2], 1);
+/// ```
 pub struct Rose<T> {
     last: AtomicPtr<RoseInner<T>>,
 }
@@ -33,18 +61,18 @@ impl<T> Rose<T> {
     const ALIGNMEMT: usize = mem::align_of::<RoseInner<T>>();
 
     #[track_caller]
-    const fn size_assert(n: usize) {
-        assert!(next_multiple_of(Self::size(n), Self::ALIGNMEMT) <= isize::MAX as usize);
+    const fn size_assert(cap: usize) {
+        assert!(next_multiple_of(Self::size(cap), Self::ALIGNMEMT) <= isize::MAX as usize);
     }
 
-    const fn size(n: usize) -> usize {
-        mem::size_of::<RoseInner<T>>().saturating_add(mem::size_of::<T>().saturating_mul(n))
+    const fn size(cap: usize) -> usize {
+        mem::size_of::<RoseInner<T>>().saturating_add(mem::size_of::<T>().saturating_mul(cap))
     }
     const fn align() -> usize {
         mem::align_of::<RoseInner<T>>()
     }
-    const fn layout(n: usize) -> Layout {
-        let size = Self::size(n);
+    const fn layout(cap: usize) -> Layout {
+        let size = Self::size(cap);
         Self::size_assert(size);
         // SAFETY: align_of returns a power of 2, and the size has been checked to be less than
         // isize::MAX.
@@ -65,9 +93,15 @@ impl<T> Rose<T> {
             if memory.is_null() {
                 handle_alloc_error(layout)
             }
-            NonNull::new_unchecked(memory as *mut RoseInner<T>)
+            NonNull::new_unchecked(memory.cast::<RoseInner<T>>())
         }
     }
+    /// Creates a new [`Rose<T>`].
+    /// ```
+    /// # use rose_bloom::Rose;
+    /// let rose: Rose<i32> = Rose::new();
+    /// ```
+    #[must_use]
     pub fn new() -> Rose<T> {
         // Allocation code
         let memory = Self::alloc(1).as_ptr();
@@ -82,6 +116,12 @@ impl<T> Rose<T> {
         }
     }
 
+    /// Push a `value` into the [`Rose`].
+    /// ```
+    /// # use rose_bloom::Rose;
+    /// let rose = Rose::new();
+    /// rose.push(1);
+    /// ```
     pub fn push(&self, value: T) -> &T {
         let item = ManuallyDrop::new(value);
         loop {
@@ -103,49 +143,44 @@ impl<T> Rose<T> {
                 }
             });
 
-            match index {
-                Ok(len) => {
-                    // We now "own" the index, as the index was increased.
-                    unsafe {
-                        let out = ptr::addr_of_mut!((*last).data).cast::<T>().add(len);
-                        out.write(((&item) as *const ManuallyDrop<T>).cast::<T>().read());
-                        return &*out;
-                    }
-                }
-                Err(_) => {
-                    let new = Self::alloc(capacity * 2);
-
-                    let refer = unsafe {
-                        let new = new.as_ptr();
-                        ptr::addr_of_mut!((*new).capacity).write(capacity * 2);
-                        ptr::addr_of_mut!((*new).length).write(AtomicUsize::new(1));
-                        ptr::addr_of_mut!((*new).next).write(last);
-                        // We just created the pointer, so we can do whatever we want with it.
-                        let out = ptr::addr_of_mut!((*new).data).cast::<T>();
-                        out.write((&item as *const ManuallyDrop<T>).cast::<T>().read());
-                        &*out
-                    };
-                    let success =
-                        self.last
-                            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |x| {
-                                if x == last {
-                                    Some(new.as_ptr())
-                                } else {
-                                    // Somebody changed our pointer.
-                                    None
-                                }
-                            });
-                    match success {
-                        Ok(_) => return refer,
-                        Err(_) => {
-                            unsafe {
-                                dealloc(new.as_ptr().cast::<u8>(), Self::layout(capacity * 2))
-                            };
-                            continue;
-                        }
-                    }
+            if let Ok(len) = index {
+                // We now "own" the index, as the index was increased.
+                unsafe {
+                    let out = ptr::addr_of_mut!((*last).data).cast::<T>().add(len);
+                    out.write(addr_of!(item).cast::<T>().read());
+                    return &*out;
                 }
             }
+
+            let new = Self::alloc(capacity * 2);
+
+            let refer = unsafe {
+                let new = new.as_ptr();
+                ptr::addr_of_mut!((*new).capacity).write(capacity * 2);
+                ptr::addr_of_mut!((*new).length).write(AtomicUsize::new(1));
+                ptr::addr_of_mut!((*new).next).write(last);
+                // We just created the pointer, so we can do whatever we want with it.
+                let out = ptr::addr_of_mut!((*new).data).cast::<T>();
+                out.write(addr_of!(item).cast::<T>().read());
+                &*out
+            };
+            let success = self
+                .last
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |x| {
+                    if x == last {
+                        Some(new.as_ptr())
+                    } else {
+                        // Somebody changed our pointer.
+                        None
+                    }
+                });
+            if success.is_ok() {
+                return refer;
+            }
+            // We failed to update the pointer, so we need to try again.
+            unsafe {
+                dealloc(new.as_ptr().cast::<u8>(), Self::layout(capacity * 2));
+            };
         }
     }
 }
@@ -160,7 +195,7 @@ impl<T> Index<usize> for Rose<T> {
             let length = unsafe { (*current).length.load(Ordering::Relaxed) };
             if length > index {
                 // Great, we found it
-                // SAFETY: add is in bounds because length > index 
+                // SAFETY: add is in bounds because length > index
                 return unsafe {
                     &*(addr_of!((*current).data)
                         .cast::<T>()
