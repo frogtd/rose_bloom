@@ -21,11 +21,13 @@ use core::{
     mem::{self, ManuallyDrop},
     ops::Index,
     ptr::{self, addr_of, addr_of_mut, NonNull},
-    sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering},
+    sync::atomic::{AtomicPtr, AtomicUsize, Ordering},
 };
+/// Iterator types.
+pub mod iter;
 
 extern crate alloc;
-use alloc::alloc::{alloc, dealloc, handle_alloc_error};
+use alloc::{alloc::{alloc, dealloc, handle_alloc_error}, vec::Vec};
 /// A lock-free growing element size linked list with stable pointers.
 /// ```
 /// use rose_bloom::Rose;
@@ -89,7 +91,8 @@ impl<T> Rose<T> {
         assert_ne!(Self::align(), 0);
         assert!(Self::size(1) != 0);
         let layout = Self::layout(capacity);
-        // SAFETY: Size is not zero, as tested above, so we can alloc.
+        // SAFETY: Size is not zero, because RoseInner<T> is at least size_of::<usize>() * 4, so
+        // we can alloc.
         // We check for null pointer and handle the alloc error, so it must be non null.
         unsafe {
             let memory = alloc(layout);
@@ -127,10 +130,10 @@ impl<T> Rose<T> {
     /// let rose = Rose::new();
     /// rose.push(1);
     /// ```
-    /// 
+    ///
     /// This is a O(1) operation.
     pub fn push(&self, value: T) -> &T {
-        let item = ManuallyDrop::new(value);
+        let mut item = ManuallyDrop::new(value);
         loop {
             let last = self.last.load(Ordering::Acquire);
 
@@ -159,7 +162,7 @@ impl<T> Rose<T> {
                 );
                 // SAFETY: We now "own" the index, as the index was increased, so we can write to it.
                 unsafe {
-                    let out = ptr::addr_of_mut!((*last).data).cast::<T>().add(len);
+                    let out = addr_of_mut!((*last).data).cast::<T>().add(len);
                     out.write(addr_of!(item).cast::<T>().read());
                     // SAFETY: last is a valid pointer.
                     (*last).writers.fetch_sub(1, Ordering::AcqRel);
@@ -175,8 +178,8 @@ impl<T> Rose<T> {
                 addr_of_mut!((*new).length).write(AtomicUsize::new(1));
                 addr_of_mut!((*new).capacity).write(capacity * 2);
                 addr_of_mut!((*new).writers).write(AtomicUsize::new(0));
-                let out = ptr::addr_of_mut!((*new).data).cast::<T>();
-                out.write(addr_of!(item).cast::<T>().read());
+                let out = addr_of_mut!((*new).data).cast::<T>();
+                out.write(addr_of_mut!(item).cast::<T>().read());
                 &*out
             };
             let success = self
@@ -201,7 +204,7 @@ impl<T> Rose<T> {
     }
 
     /// Returns the length of this [`Rose<T>`].
-    /// 
+    ///
     /// This is an O(1) operation.
     pub fn len(&self) -> usize {
         let last = self.last.load(Ordering::Acquire);
@@ -215,11 +218,18 @@ impl<T> Rose<T> {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
-    
-
+    /// Iterate over the elements of the [`Rose<T>`].
+    pub fn iter(&self) -> iter::Iter<'_, T> {
+        self.into_iter()
+    }
+    /// Iterate over the elements of the [`Rose<T>`], allowing modification.
+    pub fn iter_mut(&mut self) -> iter::IterMut<'_, T> {
+        self.into_iter()
+    }
 }
 
 /// This index is the number from the back.
+/// This is a O(log n) operation.
 impl<T> Index<usize> for Rose<T> {
     type Output = T;
 
@@ -255,10 +265,7 @@ impl<T> Drop for Rose<T> {
             // SAFETY: current is valid, data will have valid data for `length` items
             let length = unsafe { (*current).length.load(Ordering::Acquire) };
             let slice = unsafe {
-                core::slice::from_raw_parts_mut(
-                    ptr::addr_of_mut!((*current).data).cast::<T>(),
-                    length,
-                )
+                core::slice::from_raw_parts_mut(addr_of_mut!((*current).data).cast::<T>(), length)
             };
             // Drop items
             // SAFETY: slice is a valid slice
@@ -273,6 +280,27 @@ impl<T> Drop for Rose<T> {
     }
 }
 
+impl<T> From<Vec<T>> for Rose<T> {
+    fn from(mut vec: Vec<T>) -> Self {
+        let rose = Self::new();
+        for item in vec.drain(..) {
+            rose.push(item);
+        }
+        rose
+    }
+}
+
+impl<T> From<Rose<T>> for Vec<T> {
+    fn from(rose: Rose<T>) -> Self {
+        rose.into_iter().collect()
+    }
+}
+
+impl<T> Clone for Rose<T> where T: Clone {
+    fn clone(&self) -> Self {
+        Self::from(self.into_iter().cloned().collect::<Vec<_>>())
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -288,12 +316,41 @@ mod tests {
         rose.push(Box::new(2));
         assert_eq!(rose.len(), 2);
         rose.push(Box::new(3));
+        assert_eq!(rose.len(), 3);
+
         assert_eq!(*rose[0], 3);
         assert_eq!(*rose[1], 2);
         assert_eq!(*rose[2], 1);
-        assert_eq!(rose.len(), 3);
+
+        let mut iter = (&rose).into_iter();
+        assert_eq!(iter.next(), Some(&Box::new(3)));
+        assert_eq!(iter.next(), Some(&Box::new(2)));
+        assert_eq!(iter.next(), Some(&Box::new(1)));
+        assert_eq!(iter.next(), None);
+
+        let mut iter = rose.into_iter();
+        assert_eq!(iter.next(), Some(Box::new(3)));
+        assert_eq!(iter.next(), Some(Box::new(2)));
+        assert_eq!(iter.next(), Some(Box::new(1)));
+        assert_eq!(iter.next(), None);
     }
 
+    #[test]
+    fn mut_iter() {
+        use alloc::boxed::Box;
+        let mut rose = Rose::new();
+        rose.push(Box::new(1));
+        rose.push(Box::new(2));
+        rose.push(Box::new(3));
+        for x in rose.iter_mut() {
+            **x += 1;
+        }
+        let mut iter = rose.iter_mut();
+        assert_eq!(iter.next(), Some(&mut Box::new(4)));
+        assert_eq!(iter.next(), Some(&mut Box::new(3)));
+        assert_eq!(iter.next(), Some(&mut Box::new(2)));
+        assert_eq!(iter.next(), None);
+    }
     #[test]
     fn dataraces() {
         extern crate std;

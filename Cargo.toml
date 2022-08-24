@@ -1,6 +1,6 @@
 [package]
 name = "rose_bloom"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "MIT OR Unlicense"
 repository = "https://github.com/frogtd/rose_bloom"
