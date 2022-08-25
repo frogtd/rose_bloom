@@ -22,7 +22,7 @@ use core::{
     fmt::{self, Debug, Formatter},
     hash::{Hash, Hasher},
     mem::{self, ManuallyDrop},
-    ops::Index,
+    ops::{Index, IndexMut},
     ptr::{self, addr_of, addr_of_mut, NonNull},
     sync::atomic::{AtomicPtr, AtomicUsize, Ordering},
 };
@@ -52,10 +52,18 @@ pub struct Rose<T> {
 
 #[repr(C)]
 struct RoseInner<T> {
+    /// The next node in the list.
     next: *mut RoseInner<T>,
+    // The number of valid elements in the array. It is less than or equal to the capacity and
+    //  is a power of two.
     length: AtomicUsize,
+    /// The capacity is the number of elements that can be stored in the array. It is always
+    /// greater than or equal to one and is a power of two.
     capacity: usize,
+    /// The number of writers currently writing to the array. It is always less than or equal
+    /// to length.
     writers: AtomicUsize,
+    /// The data. This is a ZST but you can just peer off the end of the struct into the elements.
     data: [T; 0],
 }
 
@@ -138,6 +146,8 @@ impl<T> Rose<T> {
     /// ```
     ///
     /// This is a O(1) operation.
+    /// # Panics
+    /// Panics if there are `usize::MAX` concurrent writes happening at once.
     pub fn push(&self, value: T) -> &T {
         let mut item = ManuallyDrop::new(value);
         loop {
@@ -212,6 +222,14 @@ impl<T> Rose<T> {
     /// Returns the length of this [`Rose<T>`].
     ///
     /// This is an O(1) operation.
+    /// ```
+    /// # use rose_bloom::Rose;
+    /// let rose = Rose::new();
+    /// rose.push(1);
+    /// rose.push(2);
+    /// rose.push(3);
+    /// assert_eq!(rose.len(), 3);
+    /// ```
     pub fn len(&self) -> usize {
         let last = self.last.load(Ordering::Acquire);
         // SAFETY: last is a valid pointer.
@@ -225,21 +243,94 @@ impl<T> Rose<T> {
         self.len() == 0
     }
     /// Iterate over the elements of the [`Rose<T>`].
+    /// ```
+    /// # use rose_bloom::Rose;
+    /// let rose = Rose::new();
+    /// rose.push(1);
+    /// rose.push(2);
+    /// rose.push(3);
+    /// for i in rose.iter() {
+    ///    println!("{}", i);
+    /// }
+    /// ```
     pub fn iter(&self) -> iter::Iter<'_, T> {
         self.into_iter()
     }
     /// Iterate over the elements of the [`Rose<T>`], allowing modification.
+    /// ```
+    /// # use rose_bloom::Rose;
+    /// let mut rose = Rose::new();
+    /// rose.push(1);
+    /// rose.push(2);
+    /// rose.push(3);
+    /// for i in rose.iter_mut() {
+    ///    *i += 1;
+    /// }
+    /// ```
+    /// This is an O(n) operation.
     pub fn iter_mut(&mut self) -> iter::IterMut<'_, T> {
         self.into_iter()
     }
-}
+    /// Removes the last element from the [`Rose<T>`] and returns it, or `None` if it is empty.
+    ///
+    /// This is an O(1) operation.
+    /// ```
+    /// # use rose_bloom::Rose;
+    /// let mut rose = Rose::new();
+    /// rose.push(1);
+    /// rose.push(2);
+    /// rose.push(3);
+    /// assert_eq!(rose.pop(), Some(3));
+    /// assert_eq!(rose.pop(), Some(2));
+    /// assert_eq!(rose.pop(), Some(1));
+    /// assert_eq!(rose.pop(), None);
+    /// ```
+    pub fn pop(&mut self) -> Option<T> {
+        let mut current = NonNull::new(*self.last.get_mut())?;
+        let length = unsafe { *(*current.as_ptr()).length.get_mut() };
+        if length == 0 {
+            // Time to deallocate the current node and move on to the next one.
+            let next = unsafe { (*current.as_ptr()).next };
+            let capacity = unsafe { (*current.as_ptr()).capacity };
+            unsafe {
+                dealloc(
+                    self.last.get_mut().cast::<u8>(),
+                    Rose::<T>::layout(capacity),
+                );
+            }
+            self.last = AtomicPtr::new(next);
+            current = NonNull::new(*self.last.get_mut())?;
+        }
+        // Current must have some length, because we either just checked that, or we went forward
+        // to the next node, and the minimum capacity is 1, and because we just arrived at this
+        // node, it must have at least one element because further back nodes are always
+        //`capacity == length`.
+        let index = unsafe {
+            let index = *(*current.as_ptr()).length.get_mut() - 1;
+            *(*current.as_ptr()).length.get_mut() -= 1;
+            index
+        };
+        let base_ptr = unsafe { addr_of_mut!((*current.as_ptr()).data).cast::<T>() };
 
-/// This index is the number from the back.
-/// This is a O(log n) operation.
-impl<T> Index<usize> for Rose<T> {
-    type Output = T;
+        Some(unsafe { base_ptr.add(index).read() })
+    }
 
-    fn index(&self, mut index: usize) -> &Self::Output {
+    /// Returns a reference to an element, or `None` if the index is out of bounds.
+    /// This indexes from the back of the [`Rose<T>`] to the front.
+    /// This is an O(log n) operation.
+    /// # Examples
+    /// ```
+    /// # use rose_bloom::Rose;
+    /// let mut rose = Rose::new();
+    /// rose.push(1);
+    /// rose.push(2);
+    /// rose.push(3);
+    /// assert_eq!(rose.get(0), Some(&3));
+    /// assert_eq!(rose.get(1), Some(&2));
+    /// assert_eq!(rose.get(2), Some(&1));
+    /// assert_eq!(rose.get(3), None);
+    /// ```
+    pub fn get(&self, mut index: usize) -> Option<&T> {
         let mut current = self.last.load(Ordering::Acquire);
         while !current.is_null() {
             // SAFETY: the pointer is always valid
@@ -251,25 +342,321 @@ impl<T> Index<usize> for Rose<T> {
             if length > index {
                 // Great, we found it
                 // SAFETY: add is in bounds because length > index
-                return unsafe {
+                return Some(unsafe {
                     &*(addr_of!((*current).data)
                         .cast::<T>()
                         .add(length - index - 1))
-                };
+                });
             }
             // If we didn't find it, go to the next list item.
             index -= length;
             current = unsafe { (*current).next };
         }
-        panic!("Index {index} doesn't exist.")
+        None
+    }
+    /// Returns a mutable reference to an element, or `None` if the index is out of bounds.
+    /// This indexes from the back of the [`Rose<T>`] to the front.
+    /// This is an O(log n) operation.
+    /// # Examples
+    /// ```
+    /// # use rose_bloom::Rose;
+    /// let mut rose = Rose::new();
+    /// rose.push(1);
+    /// rose.push(2);
+    /// rose.push(3);
+    /// assert_eq!(rose.get_mut(0), Some(&mut 3));
+    /// assert_eq!(rose.get_mut(1), Some(&mut 2));
+    /// assert_eq!(rose.get_mut(2), Some(&mut 1));
+    /// assert_eq!(rose.get_mut(3), None);
+    /// ```
+    pub fn get_mut(&mut self, mut index: usize) -> Option<&mut T> {
+        let mut current = *self.last.get_mut();
+        while !current.is_null() {
+            // SAFETY: the pointer is always valid
+            // length is the number of valid areas, and there are no active writers beacuse we take
+            // &mut
+            let length = unsafe { *(*current).length.get_mut() };
+            if length > index {
+                // Great, we found it
+                // SAFETY: add is in bounds because length > index
+                return Some(unsafe {
+                    &mut *(addr_of_mut!((*current).data)
+                        .cast::<T>()
+                        .add(length - index - 1))
+                });
+            }
+            // If we didn't find it, go to the next list item.
+            index -= length;
+            current = unsafe { (*current).next };
+        }
+        None
+    }
+
+    /// Removes an element from the [`Rose<T>`] and returns it, or `None` if it is empty.
+    /// This indexes from the back of the [`Rose<T>`] to the front.
+    ///
+    /// This is an O(n) operation. Avoid using this if possible. It is better to use [`pop`].
+    /// # Examples
+    /// ```
+    /// # use rose_bloom::Rose;
+    /// let mut rose = Rose::new();
+    /// rose.push(Box::new(1));
+    /// rose.push(Box::new(2));
+    /// rose.push(Box::new(3));
+    /// assert_eq!(rose.remove(2), Some(Box::new(1)));
+    /// ```
+    pub fn remove(&mut self, mut index: usize) -> Option<T> {
+        if self.len() <= index {
+            // We can't remove anything if the index is out of bounds.
+            return None;
+        }
+        let mut current = self.last.load(Ordering::Acquire);
+        let mut prev: Option<T> = None;
+        while !current.is_null() {
+            // SAFETY: the pointer is always valid
+            // length - writers is the number of valid places.
+            let length = unsafe {
+                (*current).length.load(Ordering::Acquire)
+                    - (*current).writers.load(Ordering::Acquire)
+            };
+
+            if length > index {
+                // Great, we found it
+                // SAFETY: add is in bounds because length > index
+                let elem_ptr = unsafe {
+                    addr_of_mut!((*current).data)
+                        .cast::<T>()
+                        .add(length - index - 1)
+                };
+                let out = unsafe { elem_ptr.read() };
+                unsafe { elem_ptr.add(1).copy_to(elem_ptr, length - index - 1) };
+                unsafe {
+                    *(*current).length.get_mut() -= 1;
+                }
+
+                if let Some(elem) = prev {
+                    unsafe {
+                        addr_of_mut!((*current).data)
+                            .cast::<T>()
+                            .add(*(*current).length.get_mut())
+                            .write(elem);
+                        *(*current).length.get_mut() += 1;
+                    }
+                }
+                return Some(out);
+            }
+            // We need to move the list.
+            let base_ptr = unsafe { addr_of_mut!((*current).data).cast::<T>() };
+            let first = if length > 0 {
+                let first = Some(unsafe { base_ptr.read() });
+                // This doesn't overflow because length is always at least 1.
+                let elements = length - 1;
+                // We need to move elements forward 1.
+                // SAFETY: add is in bounds because length > 0, and there are `elements` we need to
+                // which was calculated via length.
+                unsafe {
+                    base_ptr.add(1).copy_to(base_ptr, elements);
+                }
+                // SAFETY: current is always valid and we have exclusive access to the list,
+                // so we can use .get_mut().
+                unsafe {
+                    *(*current).length.get_mut() -= 1;
+                };
+                first
+            } else {
+                None
+            };
+            if let Some(elem) = prev {
+                unsafe {
+                    base_ptr.add(*(*current).length.get_mut()).write(elem);
+                    *(*current).length.get_mut() += 1;
+                }
+            }
+            prev = first;
+            // If we didn't find it, go to the next list item.
+            index -= length;
+            current = unsafe { (*current).next };
+        }
+        unreachable!()
+    }
+
+    /// Push an element to the [`Rose<T>`].
+    /// This takes `&mut self`, so can be marginally faster than [`push`] and can return `&mut T`.
+    ///
+    /// This is an O(1) operation, amortized.
+    /// # Examples
+    /// ```
+    /// # use rose_bloom::Rose;
+    /// let mut rose = Rose::new();
+    /// rose.push_mut(1);
+    /// rose.push_mut(2);
+    /// rose.push_mut(3);
+    /// assert_eq!(rose.len(), 3);
+    /// ```
+    pub fn push_mut(&mut self, value: T) -> &mut T {
+        let current = *self.last.get_mut();
+        let length = unsafe { *(*current).length.get_mut() };
+        let capacity = unsafe { (*current).capacity };
+        if length < capacity {
+            // We have space.
+            unsafe {
+                let ptr = addr_of_mut!((*current).data).cast::<T>().add(length);
+                ptr.write(value);
+                *(*current).length.get_mut() += 1;
+                &mut *ptr
+            }
+        } else {
+            // We need to allocate
+            let ptr = Self::alloc(capacity * 2);
+            unsafe {
+                let ptr = ptr.as_ptr();
+                addr_of_mut!((*ptr).next).write(current);
+                addr_of_mut!((*ptr).length).write(AtomicUsize::new(1));
+                addr_of_mut!((*ptr).capacity).write(capacity * 2);
+                addr_of_mut!((*ptr).writers).write(AtomicUsize::new(0));
+                addr_of_mut!((*ptr).data).cast::<T>().write(value);
+                *self.last.get_mut() = ptr;
+                &mut *addr_of_mut!((*ptr).data).cast::<T>()
+            }
+        }
+    }
+    /// Returns a reference to the first element of the [`Rose<T>`].
+    /// This is an O(log n) operation.
+    /// # Examples
+    /// ```
+    /// use rose_bloom::Rose;
+    /// let mut rose = Rose::new();
+    /// rose.push(1);
+    /// rose.push(2);
+    /// rose.push(3);
+    /// assert_eq!(rose.first(), Some(&1));
+    /// ```
+    pub fn first(&self) -> Option<&T> {
+        self.get(self.len() - 1)
+    }
+
+    /// Returns a mutable reference to the first element of the [`Rose<T>`].
+    /// This is an O(log n) operation.
+    /// # Examples
+    /// ```
+    /// use rose_bloom::Rose;
+    /// let mut rose = Rose::new();
+    /// rose.push(1);
+    /// rose.push(2);
+    /// rose.push(3);
+    /// assert_eq!(rose.first_mut(), Some(&mut 1));
+    /// ```
+    pub fn first_mut(&mut self) -> Option<&mut T> {
+        self.get_mut(self.len() - 1)
+    }
+
+    /// Returns a reference to the last element of the [`Rose<T>`].
+    /// This is an O(1) operation.
+    /// # Examples
+    /// ```
+    /// use rose_bloom::Rose;
+    /// let mut rose = Rose::new();
+    /// rose.push(1);
+    /// rose.push(2);
+    /// rose.push(3);
+    /// assert_eq!(rose.last(), Some(&3));
+    /// ```
+    pub fn last(&self) -> Option<&T> {
+        self.get(0)
+    }
+
+    /// Returns a mutable reference to the last element of the [`Rose<T>`].
+    /// This is an O(1) operation.
+    /// # Examples
+    /// ```
+    /// use rose_bloom::Rose;
+    /// let mut rose = Rose::new();
+    /// rose.push(1);
+    /// rose.push(2);
+    /// rose.push(3);
+    /// assert_eq!(rose.last_mut(), Some(&mut 3));
+    /// ```
+    pub fn last_mut(&mut self) -> Option<&mut T> {
+        self.get_mut(0)
+    }
+
+    /// Clears the [`Rose<T>`], removing all values.
+    /// This is an O(n) operation.
+    /// # Examples
+    /// ```
+    /// use rose_bloom::Rose;
+    /// let mut rose = Rose::new();
+    /// rose.push(1);
+    /// rose.push(2);
+    /// rose.push(3);
+    /// assert_eq!(rose.len(), 3);
+    /// rose.clear();
+    /// assert_eq!(rose.len(), 0);
+    /// ```
+    pub fn clear(&mut self) {
+        let mut current = *self.last.get_mut();
+        let mut capacity = unsafe { (*current).capacity };
+        while capacity != 1 {
+            // SAFETY: current is valid, data will have valid data for `length` items
+            let length = *unsafe { (*current).length.get_mut() };
+            let slice = unsafe {
+                core::slice::from_raw_parts_mut(addr_of_mut!((*current).data).cast::<T>(), length)
+            };
+            // Drop items
+            // SAFETY: slice is a valid slice
+            unsafe { ptr::drop_in_place(slice) };
+            let next = unsafe { (*current).next };
+            // Dealloc Rose
+            // Current is a pointer allocated by the GlobalAlloc.
+            unsafe { dealloc(current.cast::<u8>(), Self::layout((*current).capacity)) }
+            current = next;
+            capacity = unsafe { (*current).capacity };
+        }
+        // Capacity is 1, so we can just drop the last item, if it exists.
+        let length = *unsafe { (*current).length.get_mut() };
+        if length == 1 {
+            unsafe {
+                // Drop data.
+                addr_of_mut!((*current).data).cast::<T>().read()
+            };
+            *unsafe { (*current).length.get_mut() } = 0;
+        }
+
+        self.last = AtomicPtr::new(current);
+    }
+}
+
+/// This index is the number from the back.
+/// This is a O(log n) operation.
+impl<T> Index<usize> for Rose<T> {
+    type Output = T;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        match self.get(index) {
+            Some(x) => x,
+            None => panic!("Index out of bounds, {index} is greater than {len}", len = self.len()),
+        }
+    }
+}
+
+/// This index is the number from the back.
+/// This is a O(log n) operation.
+impl<T> IndexMut<usize> for Rose<T> {
+    fn index_mut(&mut self, index: usize) -> &mut Self::Output {
+        if let Some(x) = self.get_mut(index) {
+            // This transmute is purely to avoid a compiler error that will be fixed with 
+            // polonius. I confirmed this code without the transmute works when using polonius.
+            return unsafe { core::mem::transmute(x) };
+        };
+        panic!("Index out of bounds, {index} is greater than {len}", len = self.len())
     }
 }
 impl<T> Drop for Rose<T> {
     fn drop(&mut self) {
-        let mut current = self.last.load(Ordering::Acquire);
+        let mut current = *self.last.get_mut();
         while !current.is_null() {
             // SAFETY: current is valid, data will have valid data for `length` items
-            let length = unsafe { (*current).length.load(Ordering::Acquire) };
+            let length = *unsafe { (*current).length.get_mut() };
             let slice = unsafe {
                 core::slice::from_raw_parts_mut(addr_of_mut!((*current).data).cast::<T>(), length)
             };
@@ -308,7 +695,7 @@ where
 {
     fn clone(&self) -> Self {
         let new = Self::new();
-        for x in self.into_iter() {
+        for x in self {
             new.push(x.clone());
         }
         new
@@ -457,5 +844,19 @@ mod tests {
                 rose.push(2);
             });
         });
+    }
+    #[test]
+    #[should_panic]
+    fn out_of_bounds() {
+        let rose = Rose::new();
+        rose.push(0);
+        let _= &rose[1];
+    }
+    #[test]
+    #[should_panic]
+    fn out_of_bounds_mut() {
+        let mut rose = Rose::new();
+        rose.push(0);
+        let _= &mut rose[1];
     }
 }

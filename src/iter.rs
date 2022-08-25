@@ -1,10 +1,9 @@
+#![allow(clippy::module_name_repetitions)]
 use core::{
     marker::PhantomData,
-    ptr::{addr_of, addr_of_mut, NonNull},
-    sync::atomic::{AtomicPtr, Ordering},
+    ptr::{addr_of, addr_of_mut},
+    sync::atomic::Ordering,
 };
-
-use alloc::alloc::dealloc;
 
 use crate::{Rose, RoseInner};
 /// An borrowed iterator over the elements of a `Rose`.
@@ -140,33 +139,7 @@ impl<T> IntoIterator for Rose<T> {
 impl<T> Iterator for IntoIter<T> {
     type Item = T;
     fn next(&mut self) -> Option<Self::Item> {
-        let mut current = NonNull::new(*self.rose.last.get_mut())?;
-        let length = unsafe { *(*current.as_ptr()).length.get_mut() };
-        if length == 0 {
-            // Time to deallocate the current node and move on to the next one.
-            let next = unsafe { (*current.as_ptr()).next };
-            let capacity = unsafe { (*current.as_ptr()).capacity };
-            unsafe {
-                dealloc(
-                    self.rose.last.get_mut().cast::<u8>(),
-                    Rose::<T>::layout(capacity),
-                );
-            }
-            self.rose.last = AtomicPtr::new(next);
-            current = NonNull::new(*self.rose.last.get_mut())?;
-        }
-        // Current must have some length, because we either just checked that, or we went forward
-        // to the next node, and the minimum capacity is 1, and because we just arrived at this
-        // node, it must have at least one element because further back nodes are always
-        //`capacity == length`.
-        let index = unsafe {
-            let index = *(*current.as_ptr()).length.get_mut() - 1;
-            *(*current.as_ptr()).length.get_mut() -= 1;
-            index
-        };
-        let base_ptr = unsafe { addr_of_mut!((*current.as_ptr()).data).cast::<T>() };
-
-        Some(unsafe { base_ptr.add(index).read() })
+        self.rose.pop()
     }
     fn size_hint(&self) -> (usize, Option<usize>) {
         let len = self.rose.len();
