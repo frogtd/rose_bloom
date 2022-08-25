@@ -238,6 +238,21 @@ impl<T> Rose<T> {
         let total_capacity = (capacity + 1).next_power_of_two() - 1;
         total_capacity - capacity + length
     }
+    /// Returns the capacity of this [`Rose<T>`].
+    /// ```
+    /// # use rose_bloom::Rose;
+    /// let rose = Rose::new();
+    /// rose.push(1);
+    /// rose.push(2);
+    /// rose.push(3);
+    /// assert!(rose.capacity() >= 3);
+    /// ```
+    pub fn capacity(&self) -> usize {
+        let last = self.last.load(Ordering::Acquire);
+        // SAFETY: last is a valid pointer.
+        let capacity = unsafe { (*last).capacity };
+        (capacity + 1).next_power_of_two() - 1
+    }
     /// Are there elements in the [`Rose<T>`]?
     pub fn is_empty(&self) -> bool {
         self.len() == 0
@@ -395,7 +410,7 @@ impl<T> Rose<T> {
     /// Removes an element from the [`Rose<T>`] and returns it, or `None` if it is empty.
     /// This indexes from the back of the [`Rose<T>`] to the front.
     ///
-    /// This is an O(n) operation. Avoid using this if possible. It is better to use [`pop`].
+    /// This is an O(n) operation. Avoid using this if possible. It is better to use [`Self::pop`].
     /// # Examples
     /// ```
     /// # use rose_bloom::Rose;
@@ -481,7 +496,7 @@ impl<T> Rose<T> {
     }
 
     /// Push an element to the [`Rose<T>`].
-    /// This takes `&mut self`, so can be marginally faster than [`push`] and can return `&mut T`.
+    /// This takes `&mut self`, so can be marginally faster than [`Self::push`] and can return `&mut T`.
     ///
     /// This is an O(1) operation, amortized.
     /// # Examples
