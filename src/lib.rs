@@ -63,6 +63,8 @@ struct RoseInner<T> {
     /// The number of writers currently writing to the array. It is always less than or equal
     /// to length.
     writers: AtomicUsize,
+    /// The active index. When writers is zero, this is the same as the length.
+    active_index: AtomicUsize,
     /// The data. This is a ZST but you can just peer off the end of the struct into the elements.
     data: [T; 0],
 }
@@ -132,6 +134,7 @@ impl<T> Rose<T> {
             addr_of_mut!((*memory).length).write(AtomicUsize::new(0));
             addr_of_mut!((*memory).capacity).write(1);
             addr_of_mut!((*memory).writers).write(AtomicUsize::new(0));
+            addr_of_mut!((*memory).active_index).write(AtomicUsize::new(0));
         };
         Rose {
             last: AtomicPtr::new(memory),
@@ -157,8 +160,7 @@ impl<T> Rose<T> {
             // SAFETY: Last is always a valid pointer.
             let length = unsafe { &(*last).length };
             let capacity = unsafe { (*last).capacity };
-            // We only need access to this one piece of memory, so we use Relaxed.
-            let index = length.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |x| {
+            let index = length.fetch_update(Ordering::AcqRel, Ordering::Acquire, |x| {
                 if x == capacity {
                     // We need to allocate more.
                     None
@@ -170,18 +172,28 @@ impl<T> Rose<T> {
             if let Ok(len) = index {
                 // SAFETY: last is a valid pointer.
                 // We use AcqRel to ensure that other threads are aware we're writing.
-                let writer_count = unsafe { (*last).writers.fetch_add(1, Ordering::AcqRel) };
-                // make sure `writers` isn't about to overflow
-                assert!(
-                    writer_count != usize::MAX,
-                    "writing counter overflow, somehow we have usize::MAX writers"
-                );
+                unsafe { (*last).writers.fetch_add(1, Ordering::AcqRel) };
+                // `writers` cannot overflow because its always less than or equal to`capacity`.
                 // SAFETY: We now "own" the index, as the index was increased, so we can write to it.
                 unsafe {
                     let out = addr_of_mut!((*last).data).cast::<T>().add(len);
                     out.write(addr_of!(item).cast::<T>().read());
+                    let writers = (*last).writers.fetch_sub(1, Ordering::AcqRel) - 1;
+                    let _ = (*last).active_index.fetch_update(
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                        |x| {
+                            // If we are the next write or we are the last writer,
+                            // we can set the active index.
+                            if x == len || writers == 0 {
+                                Some(len + 1)
+                            } else {
+                                None
+                            }
+                        },
+                    );
+
                     // SAFETY: last is a valid pointer.
-                    (*last).writers.fetch_sub(1, Ordering::AcqRel);
                     return &*out;
                 }
             }
@@ -194,6 +206,7 @@ impl<T> Rose<T> {
                 addr_of_mut!((*new).length).write(AtomicUsize::new(1));
                 addr_of_mut!((*new).capacity).write(capacity * 2);
                 addr_of_mut!((*new).writers).write(AtomicUsize::new(0));
+                addr_of_mut!((*new).active_index).write(AtomicUsize::new(1));
                 let out = addr_of_mut!((*new).data).cast::<T>();
                 out.write(addr_of_mut!(item).cast::<T>().read());
                 &*out
@@ -221,7 +234,7 @@ impl<T> Rose<T> {
 
     /// Returns the length of this [`Rose<T>`].
     ///
-    /// This is an O(1) operation.
+    /// This is an O(log n) operation.
     /// ```
     /// # use rose_bloom::Rose;
     /// let rose = Rose::new();
@@ -231,12 +244,16 @@ impl<T> Rose<T> {
     /// assert_eq!(rose.len(), 3);
     /// ```
     pub fn len(&self) -> usize {
-        let last = self.last.load(Ordering::Acquire);
-        // SAFETY: last is a valid pointer.
-        let length = unsafe { (*last).length.load(Ordering::Acquire) };
-        let capacity = unsafe { (*last).capacity };
-        let total_capacity = (capacity + 1).next_power_of_two() - 1;
-        total_capacity - capacity + length
+        let mut current = self.last.load(Ordering::Acquire);
+        let mut out = 0;
+        while !current.is_null() {
+            // SAFETY: current is a valid pointer.
+            let active_index = unsafe { (*current).active_index.load(Ordering::Acquire) };
+            // active_index expresses the number of elements that you can read.
+            out += active_index;
+            current = unsafe { (*current).next };
+        }
+        out
     }
     /// Returns the capacity of this [`Rose<T>`].
     /// ```
@@ -350,10 +367,7 @@ impl<T> Rose<T> {
         while !current.is_null() {
             // SAFETY: the pointer is always valid
             // length - writers is the number of valid writers.
-            let length = unsafe {
-                (*current).length.load(Ordering::Acquire)
-                    - (*current).writers.load(Ordering::Acquire)
-            };
+            let length = unsafe { (*current).active_index.load(Ordering::Acquire) };
             if length > index {
                 // Great, we found it
                 // SAFETY: add is in bounds because length > index
@@ -388,9 +402,8 @@ impl<T> Rose<T> {
         let mut current = *self.last.get_mut();
         while !current.is_null() {
             // SAFETY: the pointer is always valid
-            // length is the number of valid areas, and there are no active writers beacuse we take
-            // &mut
-            let length = unsafe { *(*current).length.get_mut() };
+            // active_index is the number of valid areas
+            let length = unsafe { *(*current).active_index.get_mut() };
             if length > index {
                 // Great, we found it
                 // SAFETY: add is in bounds because length > index
@@ -517,6 +530,7 @@ impl<T> Rose<T> {
             unsafe {
                 let ptr = addr_of_mut!((*current).data).cast::<T>().add(length);
                 ptr.write(value);
+                *(*current).active_index.get_mut() = length + 1;
                 *(*current).length.get_mut() += 1;
                 &mut *ptr
             }
@@ -529,6 +543,7 @@ impl<T> Rose<T> {
                 addr_of_mut!((*ptr).length).write(AtomicUsize::new(1));
                 addr_of_mut!((*ptr).capacity).write(capacity * 2);
                 addr_of_mut!((*ptr).writers).write(AtomicUsize::new(0));
+                addr_of_mut!((*ptr).active_index).write(AtomicUsize::new(1));
                 addr_of_mut!((*ptr).data).cast::<T>().write(value);
                 *self.last.get_mut() = ptr;
                 &mut *addr_of_mut!((*ptr).data).cast::<T>()
@@ -547,7 +562,19 @@ impl<T> Rose<T> {
     /// assert_eq!(rose.first(), Some(&1));
     /// ```
     pub fn first(&self) -> Option<&T> {
-        self.get(self.len() - 1)
+        let mut current = self.last.load(Ordering::Acquire);
+        let mut out = None;
+        while !current.is_null() {
+            // SAFETY: the pointer is always valid
+            // active_index is the number of valid places.
+            let length = unsafe { (*current).active_index.load(Ordering::Acquire) };
+            if length > 0 {
+                // SAFETY: read is valid because length > 0
+                out = Some(unsafe { &*addr_of!((*current).data).cast::<T>() });
+            }
+            current = unsafe { (*current).next };
+        }
+        out
     }
 
     /// Returns a mutable reference to the first element of the [`Rose<T>`].
@@ -562,7 +589,19 @@ impl<T> Rose<T> {
     /// assert_eq!(rose.first_mut(), Some(&mut 1));
     /// ```
     pub fn first_mut(&mut self) -> Option<&mut T> {
-        self.get_mut(self.len() - 1)
+        let mut current = *self.last.get_mut();
+        let mut out = None;
+        while !current.is_null() {
+            // SAFETY: the pointer is always valid
+            // active_index is the number of valid places.
+            let length = *unsafe { (*current).active_index.get_mut() };
+            if length > 0 {
+                // SAFETY: read is valid because length > 0
+                out = Some(unsafe { &mut *addr_of_mut!((*current).data).cast::<T>() });
+            }
+            current = unsafe { (*current).next };
+        }
+        out
     }
 
     /// Returns a reference to the last element of the [`Rose<T>`].
@@ -635,6 +674,7 @@ impl<T> Rose<T> {
                 addr_of_mut!((*current).data).cast::<T>().read()
             };
             *unsafe { (*current).length.get_mut() } = 0;
+            *unsafe { (*current).active_index.get_mut() } = 0;
         }
 
         self.last = AtomicPtr::new(current);
@@ -649,7 +689,10 @@ impl<T> Index<usize> for Rose<T> {
     fn index(&self, index: usize) -> &Self::Output {
         match self.get(index) {
             Some(x) => x,
-            None => panic!("Index out of bounds, {index} is greater than {len}", len = self.len()),
+            None => panic!(
+                "Index out of bounds, {index} is greater than {len}",
+                len = self.len()
+            ),
         }
     }
 }
@@ -659,11 +702,14 @@ impl<T> Index<usize> for Rose<T> {
 impl<T> IndexMut<usize> for Rose<T> {
     fn index_mut(&mut self, index: usize) -> &mut Self::Output {
         if let Some(x) = self.get_mut(index) {
-            // This transmute is purely to avoid a compiler error that will be fixed with 
+            // This transmute is purely to avoid a compiler error that will be fixed with
             // polonius. I confirmed this code without the transmute works when using polonius.
             return unsafe { core::mem::transmute(x) };
         };
-        panic!("Index out of bounds, {index} is greater than {len}", len = self.len())
+        panic!(
+            "Index out of bounds, {index} is greater than {len}",
+            len = self.len()
+        )
     }
 }
 impl<T> Drop for Rose<T> {
@@ -865,13 +911,35 @@ mod tests {
     fn out_of_bounds() {
         let rose = Rose::new();
         rose.push(0);
-        let _= &rose[1];
+        let _ = &rose[1];
     }
     #[test]
     #[should_panic]
     fn out_of_bounds_mut() {
         let mut rose = Rose::new();
         rose.push(0);
-        let _= &mut rose[1];
+        let _ = &mut rose[1];
     }
+
+    #[test]
+fn first_works() {
+    extern crate std;
+    use std::thread;
+    let rose = Rose::new();
+    rose.push(1);
+    thread::scope(|s| {
+        s.spawn(|| {
+            for _ in 0..10 {
+                rose.push(1);
+            }
+        });
+        s.spawn(|| {
+            // This should work because we pushed 1 item earlier
+            // so no matter how many items we have, there's always *a* first
+            for _ in 0..10 {
+                rose.first().unwrap();
+            }
+        });
+    });
+}
 }
