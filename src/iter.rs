@@ -20,21 +20,26 @@ impl<'a, T> Iterator for Iter<'a, T> {
         if self.ptr.is_null() {
             return None;
         }
-
+        // SAFETY: ptr is a valid pointer if not null.
         let mut length = unsafe { (*self.ptr).length.load(Ordering::Acquire) };
         if length == self.pos {
             // Move on to the next node, we've run out here.
+            // SAFETY: ptr is a valid pointer if not null.
             self.ptr = unsafe { (*self.ptr).next };
             if self.ptr.is_null() {
                 return None;
             }
             self.pos = 0;
+            // SAFETY: ptr is a valid pointer if not null.
             length = unsafe { (*self.ptr).length.load(Ordering::Acquire) };
         }
 
+        // SAFETY: ptr is a valid pointer if not null.
         let base_ptr = unsafe { addr_of!((*self.ptr).data).cast::<T>() };
         let index = length - self.pos - 1;
         self.pos += 1;
+
+        // SAFETY: index is a value less than the length, so it is valid to index to
         Some(unsafe { &*base_ptr.add(index) })
     }
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -44,6 +49,7 @@ impl<'a, T> Iterator for Iter<'a, T> {
         let ptr = self.ptr;
         // SAFETY: ptr is a valid pointer if not null.
         let length = unsafe { (*ptr).length.load(Ordering::Acquire) };
+        // SAFETY: ptr is a valid pointer if not null.
         let capacity = unsafe { (*ptr).capacity };
         let total_capacity = (capacity + 1).next_power_of_two() - 1;
         let len = total_capacity - capacity + length;
@@ -78,20 +84,26 @@ impl<'a, T> Iterator for IterMut<'a, T> {
             return None;
         }
 
+        // SAFETY: ptr is a valid pointer if not null.
         let mut length = unsafe { (*self.ptr).length.load(Ordering::Acquire) };
         if length == self.pos {
             // Move on to the next node, we've run out here.
+            // SAFETY: ptr is a valid pointer if not null.
             self.ptr = unsafe { (*self.ptr).next };
             if self.ptr.is_null() {
                 return None;
             }
             self.pos = 0;
+            // SAFETY: ptr is a valid pointer if not null.
             length = unsafe { (*self.ptr).length.load(Ordering::Acquire) };
         }
 
+        // SAFETY: ptr is a valid pointer if not null.
         let base_ptr = unsafe { addr_of_mut!((*self.ptr).data).cast::<T>() };
         let index = length - self.pos - 1;
         self.pos += 1;
+
+        // SAFETY: index is a value less than the length, so it is valid to index to
         Some(unsafe { &mut *base_ptr.add(index) })
     }
 
@@ -102,6 +114,7 @@ impl<'a, T> Iterator for IterMut<'a, T> {
         let ptr = self.ptr;
         // SAFETY: ptr is a valid pointer if not null.
         let length = unsafe { (*ptr).length.load(Ordering::Acquire) };
+        // SAFETY: ptr is a valid pointer if not null.
         let capacity = unsafe { (*ptr).capacity };
         let total_capacity = (capacity + 1).next_power_of_two() - 1;
         let len = total_capacity - capacity + length;

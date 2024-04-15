@@ -1,8 +1,8 @@
 # rose_bloom
 
-`rose_bloom` is a crate for passing out references that won't move when you push to it. It also 
-happens to be accidentally thread-safe, so you can also use it as a concurrent queue, if you don't
-care about freeing memory. This is a lock-free data structure.
+`rose_bloom` is a crate for passing out references that won't move when you push to it. It is also thread-safe, so you can use it as a concurrent queue if you don't care about freeing memory as you go along. It is lock-free.
+
+Many operations are O(lg n). This will still be extremely fast.
 
 ## Example
 
@@ -26,7 +26,7 @@ rose_bloom = "0.1"
 
 ## `#![no_std]`
 
-This crate is `#![no_std]` but does require the `alloc` crate.
+This crate is `#![no_std]` but does require `alloc`.
 
 ## Licenses
 
