@@ -1,9 +1,5 @@
 #![allow(clippy::module_name_repetitions)]
-use core::{
-    marker::PhantomData,
-    ptr::{addr_of, addr_of_mut},
-    sync::atomic::Ordering,
-};
+use core::{marker::PhantomData, sync::atomic::Ordering};
 
 use crate::{Rose, RoseInner};
 /// An borrowed iterator over the elements of a `Rose`.
@@ -35,7 +31,7 @@ impl<'a, T> Iterator for Iter<'a, T> {
         }
 
         // SAFETY: ptr is a valid pointer if not null.
-        let base_ptr = unsafe { addr_of!((*self.ptr).data).cast::<T>() };
+        let base_ptr = unsafe { (&raw const (*self.ptr).data).cast::<T>() };
         let index = length - self.pos - 1;
         self.pos += 1;
 
@@ -99,7 +95,7 @@ impl<'a, T> Iterator for IterMut<'a, T> {
         }
 
         // SAFETY: ptr is a valid pointer if not null.
-        let base_ptr = unsafe { addr_of_mut!((*self.ptr).data).cast::<T>() };
+        let base_ptr = unsafe { (&raw mut (*self.ptr).data).cast::<T>() };
         let index = length - self.pos - 1;
         self.pos += 1;
 
@@ -156,6 +152,57 @@ impl<T> Iterator for IntoIter<T> {
     }
     fn size_hint(&self) -> (usize, Option<usize>) {
         let len = self.rose.len();
+        (len, Some(len))
+    }
+}
+
+/// An iterator over the elements of a `Rose`.
+pub struct IterRaw<'a, T: 'a> {
+    pub(crate) rose: PhantomData<&'a Rose<T>>,
+    pub(crate) pos: usize,
+    pub(crate) ptr: *mut RoseInner<T>,
+}
+
+impl<'a, T> Iterator for IterRaw<'a, T> {
+    type Item = *mut T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.ptr.is_null() {
+            return None;
+        }
+        // SAFETY: ptr is a valid pointer if not null.
+        let mut length = unsafe { (*self.ptr).length.load(Ordering::Acquire) };
+        if length == self.pos {
+            // Move on to the next node, we've run out here.
+            // SAFETY: ptr is a valid pointer if not null.
+            self.ptr = unsafe { (*self.ptr).next };
+            if self.ptr.is_null() {
+                return None;
+            }
+            self.pos = 0;
+            // SAFETY: ptr is a valid pointer if not null.
+            length = unsafe { (*self.ptr).length.load(Ordering::Acquire) };
+        }
+
+        // SAFETY: ptr is a valid pointer if not null.
+        let base_ptr = unsafe { (&raw mut (*self.ptr).data).cast::<T>() };
+        let index = length - self.pos - 1;
+        self.pos += 1;
+
+        // SAFETY: index is a value less than the length, so it is valid to index to
+        Some(unsafe { base_ptr.add(index) })
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        if self.ptr.is_null() {
+            return (0, Some(0));
+        }
+        let ptr = self.ptr;
+        // SAFETY: ptr is a valid pointer if not null.
+        let length = unsafe { (*ptr).length.load(Ordering::Acquire) };
+        // SAFETY: ptr is a valid pointer if not null.
+        let capacity = unsafe { (*ptr).capacity };
+        let total_capacity = (capacity + 1).next_power_of_two() - 1;
+        let len = total_capacity - capacity + length;
         (len, Some(len))
     }
 }

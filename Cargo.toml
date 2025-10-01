@@ -1,7 +1,7 @@
 [package]
 name = "rose_bloom"
-version = "0.1.5"
-edition = "2021"
+version = "0.1.6"
+edition = "2024"
 license = "MIT OR Unlicense"
 repository = "https://github.com/frogtd/rose_bloom"
 description = "A concurrent growing element size linked list with stable pointers."
